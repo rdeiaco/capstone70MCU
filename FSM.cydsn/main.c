@@ -21,6 +21,8 @@
 #include <project.h>
 #include <stdlib.h>
 
+#include "filter.h"
+#include "print.h"
 #include "queue.h"
 
 /* LED control defines (active low)*/
@@ -43,73 +45,18 @@ uint8 sample_lines;
 ********************************************************************************/
 
 CY_ISR(InterruptHandler)
-{
-    
+{    
     if (Timer_INTR_MASK_TC == Timer_GetInterruptSource()) {
         // Timer has overflowed, 1ms has elapsed.
         // Clear interrupt, then set flag to execute finite state control loop.
         Timer_ClearInterrupt(Timer_INTR_MASK_TC);
-        sample_lines = 1;
-        
+        sample_lines = 1;        
     }
 }
 
-void print_hex(int val) {
-    UART_1_UartPutString("0x");
-    int temp;
-    int i;
-    for (i = 7; i >= 0; i++) {
-        temp = (val >> (4*i)) & 0xF;
-        if (temp < 10) {
-            UART_1_UartPutChar('0' + temp);
-        }
-        else {
-            UART_1_UartPutChar('A' + temp - 10);
-        }
-    }
-}
 
-void print_int (int val) {
 
-  int temp = val;
-  int i = 0;
-  int j, div;
-  int num_count = 1;
-  int dig_count;
-
-  while (num_count != 0) {
-
-    if ( i == 1) {
-      div = 1;
-      for ( j = num_count; j > 0; j-- ) {
-        div *= 10;
-      }
-      temp = val % div;
-      num_count--;
-    }
-    else {
-      num_count = 0;
-    }
-
-    dig_count = 0;
-    
-    while (temp/10 != 0) {
-      temp = temp/10;
-      dig_count++;
-      if ( i == 0 ) {
-        num_count++;
-      }
-    }
-    
-    if (dig_count < num_count) {
-      temp = 0;
-    }
-    
-    UART_1_UartPutChar('0' + temp);
-
-    i=1;
-  }
-}
+uint8 filter_sample(uint8 reading, queue_t *prev);
 
 int main()
 {   
@@ -126,13 +73,9 @@ int main()
     /* Start components */
     Timer_Start();
     
-    // The digital values from the low, medium and high filters, respectively.
     
-    uint8 *low_val;
-    uint8 *med_val;
-    uint8 *high_val;
     // The state of the FSM.
-    uint8 state;
+    uint8 state = 0;
     uint32 i = 0;
     
     UART_1_Start();
@@ -148,69 +91,181 @@ int main()
     UART_1_UartPutString("\r\n");
     print_int(0);
     UART_1_UartPutString("\r\n");
-
-    low_val = (uint8 *) malloc(SIZE*sizeof(uint8));
-    med_val = (uint8 *) malloc(SIZE*sizeof(uint8));
-    high_val = (uint8 *) malloc(SIZE*sizeof(uint8));
     
     queue_t low_prev;
     queue_t med_prev;
     queue_t high_prev;
-    int temp;
-    uint8 reading;
+    int low_count;
+    int med_count;
+    int high_count;
+    int liveness_count;
     
     init_queue(&low_prev);
     init_queue(&med_prev);
     init_queue(&high_prev);
     
-    UART_1_UartPutString("Malloc Succesful.\r\n");
-    
-    while(i < SIZE) {
-        
+    for(;;) {
         if (sample_lines) {
             sample_lines = 0;
             
-            reading = LOW_FILTER_INPUT_Read();
-            temp = (int)reading;
-            temp += sum(&low_prev);
-            temp >>= 2;
-            low_val[i] = (uint8)temp;
-            push(&low_prev, reading);
-            
-            reading = MED_FILTER_INPUT_Read();
-            temp = (int)reading;
-            temp += sum(&med_prev);
-            temp >>= 2;
-            med_val[i] = (uint8)temp;
-            push(&med_prev, reading);
-            
-            reading = HIGH_FILTER_INPUT_Read();
-            temp = (int)reading;
-            temp += sum(&high_prev);
-            temp >>= 2;
-            high_val[i] = (uint8)temp;
-            push(&high_prev, reading);
-                 
-            i++;
-        }       
-    }
-    
-    UART_1_UartPutString("Loop Broken.\r\n");
-    
-    for (i = 0; i < SIZE; i++) { 
-        print_int(i);
-        
-        UART_1_UartPutString(" ");
-        UART_1_UartPutChar(low_val[i] + '0');
-        UART_1_UartPutString(" ");
-        UART_1_UartPutChar(med_val[i] + '0');
-        UART_1_UartPutString(" ");
-        UART_1_UartPutChar(high_val[i] + '0');
-        UART_1_UartPutString("\r\n");
+            switch(state) {
+                
+                /* This is the state that is entered upon reset.
+                 * In the future, this state should be returned to upon 
+                 * event detection if the user applies an input (possibly a
+                 * pushbutton to start with, and a BLE signal in the future).
+                 */
+                case 0:
+                    low_count = 0;
+                    med_count = 0;
+                    high_count = 0;
+                    LED_GREEN_Write(LIGHT_OFF);
+                    LED_BLUE_Write(LIGHT_OFF);
+                    LED_RED_Write(LIGHT_OFF);
+                    state = 1;
+                    break;
+                
+                /* In this state, keep a running count of each filtered input.
+                 * If the counts exceed certain thresholds, proceed to either the
+                 * alarm recognition state or the siren recognition state.
+                 */
+                // TODO break up count into helper functions, make new header file.
+                case 1:
+                    low_count = filter_count(LOW_FILTER_INPUT_Read(), &low_prev, low_count);
+                    med_count = filter_count(MED_FILTER_INPUT_Read(), &med_prev, med_count);
+                    high_count = filter_count(HIGH_FILTER_INPUT_Read(), &high_prev, high_count); 
+                    UART_1_UartPutString("S1 ");
+                    print_int(low_count);
+                    UART_1_UartPutString(" ");
+                    print_int(med_count);
+                    UART_1_UartPutString(" ");
+                    print_int(high_count);
+                    UART_1_UartPutString("\r\n");
+                    
+                    /* Check for fire alarm threshold. */
+                    if ((low_count > 300) && (med_count > 300) && (high_count > 300)) {
+                        state = 5;
+                        low_count = 0;
+                        med_count = 0;
+                        high_count = 0;
+                        liveness_count = 0;
+                        LED_RED_Write(LIGHT_ON);
+                    }
+                    /* Check for siren threshold. */
+                    else if ((low_count > 40) && (med_count < 25) && (high_count < 10)) {
+                        state = 2;
+                        low_count = 0;
+                        med_count = 0;
+                        high_count = 0;
+                        liveness_count = 0;
+                        LED_BLUE_Write(LIGHT_ON);
+                    }
+                    break;
+                
+                /* In this state, check to see if the medium frequency range has been
+                 * captured. If the signal remains too low for too long, return back to the 
+                 * initial stage.
+                 */
+                case 2:
+                    liveness_count++;
+                    low_count = filter_count(LOW_FILTER_INPUT_Read(), &low_prev, low_count);
+                    med_count = filter_count(MED_FILTER_INPUT_Read(), &med_prev, med_count);
+                    high_count = filter_count(HIGH_FILTER_INPUT_Read(), &high_prev, high_count); 
+                    UART_1_UartPutString("S2 ");
+                    print_int(low_count);
+                    UART_1_UartPutString(" ");
+                    print_int(med_count);
+                    UART_1_UartPutString(" ");
+                    print_int(high_count);
+                    UART_1_UartPutString(" ");
+                    print_int(liveness_count);
+                    UART_1_UartPutString("\r\n");
+                    
+                    if (liveness_count > 120) {
+                        state = 0;
+                        low_count = 0;
+                        med_count = 0;
+                        high_count = 0;
+                        liveness_count = 0;                        
+                        LED_BLUE_Write(LIGHT_OFF);
+                    }
+                    else if ((low_count > 40) && (med_count > 50) && (high_count < 25)) {
+                        state = 3;
+                        low_count = 0;
+                        med_count = 0;
+                        high_count = 0;
+                        liveness_count = 0;
+                    }                                            
+                    break;
+                    
+                case 3:
+                    liveness_count++;
+                    low_count = filter_count(LOW_FILTER_INPUT_Read(), &low_prev, low_count);
+                    med_count = filter_count(MED_FILTER_INPUT_Read(), &med_prev, med_count);
+                    high_count = filter_count(HIGH_FILTER_INPUT_Read(), &high_prev, high_count);
+                    
+                    UART_1_UartPutString("S3 ");
+                    print_int(low_count);
+                    UART_1_UartPutString(" ");
+                    print_int(med_count);
+                    UART_1_UartPutString(" ");
+                    print_int(high_count);
+                    UART_1_UartPutString(" ");
+                    print_int(liveness_count);
+                    UART_1_UartPutString("\r\n");
+                    
+                    if (liveness_count > 140) {
+                        state = 0;
+                        low_count = 0;
+                        med_count = 0;
+                        high_count = 0;
+                        liveness_count = 0;
+                        LED_BLUE_Write(LIGHT_OFF);
+                    }
+                    else if ((low_count < 35) && (med_count > 30) && (high_count > 50)) {
+                        state = 4;
+                        low_count = 0;
+                        med_count = 0;
+                        high_count = 0;
+                        liveness_count = 0;
+                        LED_BLUE_Write(LIGHT_OFF);
+                        LED_GREEN_Write(LIGHT_ON);
+                        UART_1_UartPutString("Siren Detected\r\n");
+                    }
+                    break;
+                /* Wait for user input to reset state machine. */
+                case 4:
+                    while(USER_INPUT_Read());
+                    while(!USER_INPUT_Read());
+                    state = 0;
+                    LED_GREEN_Write(LIGHT_OFF);
+                    break;
+                    
+                /* In this state, begin detection of the fire alarm.
+                 */
+                case 5:
+                    LED_RED_Write(LIGHT_ON);
+                    while(USER_INPUT_Read());
+                    while(!USER_INPUT_Read());
+                    LED_RED_Write(LIGHT_OFF);
+                    state = 0;                   
+                    break;
+                    
+                /* In this state, wait until user input to reset the
+                 * FSM.
+                 */
+                case 6:
+                    break;
+                    
+                default:
+                    break;
+            }        
+        }
     }
     
     return 1;
 }
+
 
 
 
